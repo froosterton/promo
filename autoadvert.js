@@ -90,6 +90,15 @@ const CANNED_ROBUD_REPLIES = [
   'just get robud instead of sending w/ls'
 ];
 
+/** Casual one-liners when someone asks what the promo is — same energy as CANNED_ROBUD_REPLIES, then link on next line. */
+const ROBUD_INTEREST_VAGUE_PROMO_LINES = [
+  'its robud js a chrome ext for roblox trades / values n w l stuff',
+  'oh thats robud browser extension for trading n values ingame',
+  'robud lol its for roblox trading w l type stuff',
+  'js robud — ext that helps w trades and values',
+  'its called robud chrome ext for roblox trade stuff'
+];
+
 /**
  * Real server W/L trade-image nudges — off unless you enable.
  */
@@ -99,6 +108,38 @@ const PROD_ROBUD_MIN_VALUE = 50_000;
 
 /** If slowmode is off, wait this long before auto-replying on prod nudges (ms). */
 const DEFAULT_REPLY_DELAY_MS = 5000;
+
+/**
+ * Gemini classifies interest and writes the in-channel reply (no fixed phrase matching).
+ * Set ENABLE_PROD_INTEREST_INFO_REPLIES=0 to disable auto-replies (webhook can stay on).
+ */
+const ENABLE_PROD_INTEREST_INFO_REPLIES = process.env.ENABLE_PROD_INTEREST_INFO_REPLIES !== '0';
+/** Min ms between our robud info replies to the same user (follow-ups allowed). */
+const PROD_INTEREST_REPLY_COOLDOWN_MS = Number(process.env.PROD_INTEREST_REPLY_COOLDOWN_MS) || 20_000;
+const ROBUD_INFO_URL = (
+  process.env.ROBUD_INFO_URL ||
+  'https://chromewebstore.google.com/detail/robud-roblox-trade-helper/plheomohlllkkidlhlebdaibdpkognop'
+).trim();
+/** How long we treat a user as “interested” for follow-up Gemini checks (ms). */
+const ROBUD_INTEREST_USER_TTL_MS = Number(process.env.ROBUD_INTEREST_USER_TTL_MS) || 7 * 24 * 60 * 60 * 1000;
+/**
+ * Style / facts the model must follow when generating replies (your “it’s called robud” rules).
+ * Edit this list; it is injected into the Gemini prompt.
+ */
+const ROBUD_REPLY_STYLE_GUIDE = [
+  'product is robud (lowercase) — chrome extension for roblox trading / values / w l',
+  'match the voice of casual Discord: very short, messy, lowercase ok, "js" for just, "u" ok, no marketing sentences',
+  'never sound like a bot, FAQ, or customer support — no em dashes, no "in-game" corporate phrasing, no "hope this helps"',
+  `if they need the install link, end with the url on its own last line: ${ROBUD_INFO_URL}`,
+  'one or two lines of body text max before the url line; do not list features like a product page'
+];
+/**
+ * Optional: force one exact reply for vague promo questions (full message including url if you want).
+ * If unset, a random line from ROBUD_INTEREST_VAGUE_PROMO_LINES + newline + store url.
+ */
+const ROBUD_INTEREST_CANONICAL_REPLY = (process.env.ROBUD_INTEREST_CANONICAL_REPLY || '').trim();
+/** If Gemini fails entirely, random casual line + link (override full text with ROBUD_INTEREST_FALLBACK_REPLY). */
+const ROBUD_INTEREST_FALLBACK_REPLY = (process.env.ROBUD_INTEREST_FALLBACK_REPLY || '').trim();
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
@@ -166,6 +207,16 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function buildVaguePromoInterestReply() {
+  if (ROBUD_INTEREST_CANONICAL_REPLY) return ROBUD_INTEREST_CANONICAL_REPLY;
+  return `${pickRandom(ROBUD_INTEREST_VAGUE_PROMO_LINES)}\n${ROBUD_INFO_URL}`;
+}
+
+function buildInterestFallbackReply() {
+  if (ROBUD_INTEREST_FALLBACK_REPLY) return ROBUD_INTEREST_FALLBACK_REPLY;
+  return `${pickRandom(ROBUD_INTEREST_VAGUE_PROMO_LINES)}\n${ROBUD_INFO_URL}`;
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -227,6 +278,10 @@ let promoImageRotate = 0;
 let lastWebhookPromoGateOnline = undefined;
 
 const interestWebhookHandledIds = new Set();
+/** Last time we sent an in-channel robud info reply per user (interest flow). */
+const prodInterestLastReplyByUserId = new Map();
+/** userId -> last time Gemini marked them interested (for follow-up questions). */
+const robudInterestedUserLastSeen = new Map();
 
 /** Recent image promo message IDs (this session) — used to detect replies. */
 const RECENT_PROMO_MESSAGE_IDS_CAP = 15;
@@ -414,13 +469,157 @@ async function emitPromotionStartedWebhook(sentMessage) {
   console.log('[Webhook] Promotion started — image sent');
 }
 
-function messageMatchesInterestTrigger(raw) {
+function pruneRobudInterestedUsers() {
+  const now = Date.now();
+  for (const [uid, t] of robudInterestedUserLastSeen) {
+    if (now - t > ROBUD_INTEREST_USER_TTL_MS) robudInterestedUserLastSeen.delete(uid);
+  }
+}
+
+function userIsRobudInterested(uid) {
+  const t = robudInterestedUserLastSeen.get(uid);
+  if (t == null) return false;
+  if (Date.now() - t > ROBUD_INTEREST_USER_TTL_MS) {
+    robudInterestedUserLastSeen.delete(uid);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Loose pre-filter so we do not call Gemini on every prod line — Gemini still decides real interest.
+ */
+/** Short vague identity questions on a promo thread → casual fixed reply (same vibe as CANNED_ROBUD_REPLIES), not Gemini paraphrase. */
+function isVaguePromoIdentityQuestion(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 100) return false;
+  if (/\bwhat\s+is\s+(this|that|it)\b/.test(t)) return true;
+  if (/\bwhat('?s| is)\s+that\b/.test(t)) return true;
+  if (/\bwhat\s+are\s+you\s+(showing|posting)\b/.test(t)) return true;
+  if (/\bwhat\s+extension\b/.test(t) && t.length < 80) return true;
+  return false;
+}
+
+function messageMaybeRobudRelatedColdScan(raw) {
   const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!t) return false;
-  if (/\bwhat\s+is\s+(that|this)\b/.test(t)) return true;
-  if (/\bhow\s+do\s+i\s+get\s+that\b/.test(t)) return true;
-  if (/\bis\s+this\s+an\s+extension\b/.test(t)) return true;
+  if (/\?/.test(t)) return true;
+  if (/\b(what|how|where|which|who|why)\b/.test(t)) return true;
+  if (
+    /\b(extension|plugin|addon|browser|chrome|install|download|website|link|url)\b/.test(t)
+  ) {
+    return true;
+  }
+  if (/\b(get|grab)\s+(it|that|this)\b/.test(t)) return true;
+  if (/\brobud\b/.test(t)) return true;
   return false;
+}
+
+function parseInterestGeminiJson(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const o = JSON.parse(s.slice(start, end + 1));
+    const interested = Boolean(o.interested);
+    const replyText =
+      o.replyText != null && String(o.replyText).trim() ? String(o.replyText).trim() : '';
+    const contextNote =
+      o.contextNote != null && String(o.contextNote).trim()
+        ? String(o.contextNote).trim().slice(0, 120)
+        : '';
+    return { interested, replyText, contextNote };
+  } catch {
+    return null;
+  }
+}
+
+async function classifyAndReplyRobudInterestWithGemini(message, { replyToPromo, alreadyInterested }) {
+  const styleBlock = ROBUD_REPLY_STYLE_GUIDE.map((line, i) => `${i + 1}. ${line}`).join('\n');
+
+  const contextLines = [];
+  if (replyToPromo) {
+    contextLines.push(
+      'This message is a REPLY to our recent image promo in the same channel (screenshot ad).'
+    );
+  }
+  if (alreadyInterested) {
+    contextLines.push(
+      'This user was already marked interested in robud recently — they may be asking a follow-up (what it is, how to get it, what it does).'
+    );
+  }
+  const contextBlock =
+    contextLines.length > 0 ? `${contextLines.join('\n')}\n\n` : '';
+
+  const msgText = (message.content || '').trim() || '(no text — attachments only or empty)';
+
+  const prompt = `You are helping a Discord selfbot decide if a human is genuinely asking about a promoted product called "robud" (Roblox trade helper browser extension).
+
+${contextBlock}User message:
+---
+${msgText.slice(0, 1800)}
+---
+
+Decide if they are interested in learning about robud / the extension / how to get it / what it does — including informal or vague wording, typos, or hostility mixed with a real question. If they are clearly only trash-talking with NO genuine question about the product, not interested.
+
+Style rules for your reply (when you do reply):
+${styleBlock}
+
+Respond with JSON ONLY, no markdown, no extra keys:
+{"interested": true or false, "replyText": "string — empty if not interested", "contextNote": "brief label for logs e.g. promo_reply_question"}
+
+If interested is false, replyText must be "".
+If interested is true, replyText must be under 400 characters, 1-2 short lines of messy casual text, then if they need the link add a newline and the chrome web store url alone on the last line. Sound like a normal user typing fast, not a product description.
+
+Good voice examples (do not repeat verbatim): "js robud chrome ext for trades n values" / "its robud lol helps w w l stuff" / "oh thats robud u can grab it here" + url`;
+
+  for (let attempt = 0; attempt < GEMINI_RETRIES; attempt++) {
+    for (const modelName of GEMINI_MODELS) {
+      try {
+        const model = getGeminiModel(modelName);
+        const result = await model.generateContent(prompt);
+        const text = extractTextFromGeminiResult(result, `interest-${modelName}`);
+        const parsed = parseInterestGeminiJson(text);
+        if (parsed) return parsed;
+      } catch (e) {
+        if (isGeminiRetryableError(e) && attempt < GEMINI_RETRIES - 1) {
+          await sleep(GEMINI_RETRY_BASE_MS * 2 ** attempt);
+        } else {
+          console.warn(`[Interest] Gemini error [${modelName}]:`, e.message || e);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function trySendProdGeminiInterestReply(message, replyBody) {
+  if (!ENABLE_PROD_INTEREST_INFO_REPLIES) return;
+  if (promoGateIsOnline) return;
+
+  const uid = message.author.id;
+  const last = prodInterestLastReplyByUserId.get(uid) || 0;
+  if (Date.now() - last < PROD_INTEREST_REPLY_COOLDOWN_MS) return;
+
+  const ch = await message.client.channels
+    .fetch(PROD_CHANNEL_ID, { force: true })
+    .catch(() => null);
+  const delay = ch ? replyDelayMs(ch) : DEFAULT_REPLY_DELAY_MS;
+  await sleep(delay);
+
+  let safe = (replyBody || '').trim().slice(0, 1990);
+  if (!safe) safe = buildInterestFallbackReply().slice(0, 1990);
+
+  try {
+    await message.reply(safe);
+    prodInterestLastReplyByUserId.set(uid, Date.now());
+    console.log(`[Interest reply] → ${message.author.tag}`);
+  } catch (e) {
+    console.warn('[Interest reply] Failed:', e.message || e);
+  }
 }
 
 async function messageIsReplyToOurPromo(message) {
@@ -437,72 +636,103 @@ async function messageIsReplyToOurPromo(message) {
   }
 }
 
-async function tryHandleProdInterestWebhook(message) {
-  if (!DISCORD_WEBHOOK_URL) return;
+async function tryHandleProdUserInterest(message) {
   if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
   if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return;
   if (interestWebhookHandledIds.has(message.id)) return;
 
-  const phraseHit = messageMatchesInterestTrigger(message.content);
   const replyToPromo = await messageIsReplyToOurPromo(message);
-  if (!phraseHit && !replyToPromo) return;
+  const alreadyInterested = userIsRobudInterested(message.author.id);
+  const coldOk = messageMaybeRobudRelatedColdScan(message.content);
+
+  if (!replyToPromo && !alreadyInterested && !coldOk) return;
 
   interestWebhookHandledIds.add(message.id);
   if (interestWebhookHandledIds.size > 5000) interestWebhookHandledIds.clear();
 
-  const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
-  let avatar = '';
-  try {
-    avatar =
-      typeof message.author.displayAvatarURL === 'function'
-        ? message.author.displayAvatarURL({ dynamic: true, size: 256 })
-        : '';
-  } catch {
-    avatar = '';
+  pruneRobudInterestedUsers();
+
+  const gemini = await classifyAndReplyRobudInterestWithGemini(message, {
+    replyToPromo,
+    alreadyInterested
+  });
+
+  if (!gemini?.interested) {
+    if (gemini === null) {
+      console.warn('[Interest] Gemini returned no parseable result — skip webhook/reply');
+    }
+    return;
   }
 
-  const contextParts = [];
-  if (replyToPromo) contextParts.push('Reply to image promo');
-  if (phraseHit) contextParts.push('Trigger phrase');
-  const contextLine = contextParts.length ? contextParts.join(' · ') : '—';
+  robudInterestedUserLastSeen.set(message.author.id, Date.now());
 
-  const embed = {
-    title: 'User interested',
-    url: jump,
-    color: 0x57f287,
-    author: {
-      name: message.author.tag,
-      ...(avatar ? { icon_url: avatar } : {})
-    },
-    ...(avatar ? { thumbnail: { url: avatar } } : {}),
-    fields: [
-      {
-        name: 'Username',
-        value: message.author.tag,
-        inline: true
-      },
-      {
-        name: 'Context',
-        value: contextLine.slice(0, 256),
-        inline: true
-      },
-      {
-        name: 'Message',
-        value: (message.content || '(no text)').slice(0, 900) || '—',
-        inline: false
-      },
-      {
-        name: 'Jump',
-        value: `[Open message](${jump})`,
-        inline: false
-      }
-    ],
-    timestamp: new Date().toISOString()
-  };
+  const useCasualVaguePromoReply =
+    replyToPromo && isVaguePromoIdentityQuestion(message.content);
 
-  await postDiscordWebhook({ embeds: [embed] });
-  console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+  if (DISCORD_WEBHOOK_URL) {
+    const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
+    let avatar = '';
+    try {
+      avatar =
+        typeof message.author.displayAvatarURL === 'function'
+          ? message.author.displayAvatarURL({ dynamic: true, size: 256 })
+          : '';
+    } catch {
+      avatar = '';
+    }
+
+    const contextParts = [];
+    if (replyToPromo) contextParts.push('Reply to image promo');
+    if (alreadyInterested) contextParts.push('Follow-up (known interested)');
+    if (useCasualVaguePromoReply) contextParts.push('Casual fixed (vague promo question)');
+    if (gemini.contextNote) contextParts.push(gemini.contextNote);
+    const contextLine = contextParts.length ? contextParts.join(' · ') : 'Gemini: interested';
+
+    const embed = {
+      title: 'User interested',
+      url: jump,
+      color: 0x57f287,
+      author: {
+        name: message.author.tag,
+        ...(avatar ? { icon_url: avatar } : {})
+      },
+      ...(avatar ? { thumbnail: { url: avatar } } : {}),
+      fields: [
+        {
+          name: 'Username',
+          value: message.author.tag,
+          inline: true
+        },
+        {
+          name: 'Context',
+          value: contextLine.slice(0, 256),
+          inline: true
+        },
+        {
+          name: 'Message',
+          value: (message.content || '(no text)').slice(0, 900) || '—',
+          inline: false
+        },
+        {
+          name: 'Jump',
+          value: `[Open message](${jump})`,
+          inline: false
+        }
+      ],
+      timestamp: new Date().toISOString()
+    };
+
+    try {
+      await postDiscordWebhook({ embeds: [embed] });
+      console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+    } catch (e) {
+      console.warn('[Webhook] Interest ping failed:', e.message || e);
+    }
+  }
+
+  const replyBody = useCasualVaguePromoReply ? buildVaguePromoInterestReply() : gemini.replyText;
+  await trySendProdGeminiInterestReply(message, replyBody);
 }
 
 async function postOptionalChatWatchWebhook({
@@ -1282,7 +1512,7 @@ client.on('messageCreate', async (message) => {
       prodChannelMessageSerial++;
     }
 
-    await tryHandleProdInterestWebhook(message);
+    await tryHandleProdUserInterest(message);
 
     if (await tryHandleProdCannedReplyPromo(message)) return;
     if (await tryHandleProdWlChannel(message)) return;
@@ -1307,6 +1537,11 @@ client.on('ready', async () => {
   }
   if (ENABLE_PROD_WL_REPLIES) {
     console.log(`[Prod W/L] ENABLED — trade image nudges in ${PROD_CHANNEL_ID}`);
+  }
+  if (ENABLE_PROD_INTEREST_INFO_REPLIES) {
+    console.log(
+      `[Interest reply] Gemini classifies interest in ${PROD_CHANNEL_ID} — generated replies follow ROBUD_REPLY_STYLE_GUIDE; cooldown ${PROD_INTEREST_REPLY_COOLDOWN_MS / 1000}s per user; follow-ups for ${Math.round(ROBUD_INTEREST_USER_TTL_MS / 86400000)}d after first interest.`
+    );
   }
 
   cachedAdvertChannel = await client.channels.fetch(PROD_CHANNEL_ID);
