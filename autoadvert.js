@@ -24,8 +24,13 @@ const GEMINI_API_KEY = requireEnv('GEMINI_API_KEY');
  */
 const DISCORD_WEBHOOK_URL = (process.env.DISCORD_WEBHOOK_URL || '').trim();
 
+/** All automated replies (interest follow-ups, canned promos, W/L nudges) and image adverts use this guild + text channel only. */
 const PROD_GUILD_ID = '415246288779608064';
 const PROD_CHANNEL_ID = '442709792839172099';
+
+function isProdTargetChannel(message) {
+  return message?.guild?.id === PROD_GUILD_ID && message?.channel?.id === PROD_CHANNEL_ID;
+}
 
 /**
  * Every advert is preceded by this much live sampling on PROD_CHANNEL_ID (Gemini + console; optional DISCORD_WEBHOOK_URL embed).
@@ -88,6 +93,31 @@ const CANNED_ROBUD_REPLIES = [
   'get robud instead of sending w/ls',
   'js get robud',
   'just get robud instead of sending w/ls'
+];
+
+/**
+ * Fallback in-channel lines if Gemini reply generation fails — keep same casual teen voice as the model prompt.
+ */
+const INTEREST_REPLY_WHAT_IS_LINES = [
+  'its js called robud',
+  'nah its just robud',
+  'js an extension called robud'
+];
+
+const INTEREST_REPLY_WHAT_IT_DOES_LINES = [
+  'just tells u if a trade is a w or l',
+  'tells u if a trade is good or not'
+];
+
+const INTEREST_REPLY_WHERE_LINES = [
+  'js search up robud on chrome webstore',
+  'lookup robud on chrome store',
+  'js lookup getrobud on google'
+];
+
+const INTEREST_REPLY_EXTENSION_CONFIRM_LINES = [
+  'ye its a chrome extension',
+  'yeah browser extension js'
 ];
 
 /**
@@ -226,10 +256,10 @@ let promoImageRotate = 0;
 /** `undefined` until first observation; then used to avoid duplicate gate webhooks. */
 let lastWebhookPromoGateOnline = undefined;
 
-const interestWebhookHandledIds = new Set();
+const prodInterestHandledIds = new Set();
 
-/** Recent image promo message IDs (this session) — used to detect replies. */
-const RECENT_PROMO_MESSAGE_IDS_CAP = 15;
+/** Recent outreach message IDs: image promos + canned/W-L nudges — used to detect replies to our messages. */
+const RECENT_PROMO_MESSAGE_IDS_CAP = 30;
 const recentPromoMessageIds = [];
 
 function rememberPromoMessageId(id) {
@@ -283,7 +313,7 @@ function stringifyBucketCounts(bc) {
 
 function appendChatWatchSample(message) {
   if (!chatWatchActive) return;
-  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
+  if (!isProdTargetChannel(message)) return;
   if (message.author?.bot) return;
   if (message.author?.id === message.client?.user?.id) return;
   if (message.createdTimestamp < chatWatchWindowStart) return;
@@ -414,42 +444,225 @@ async function emitPromotionStartedWebhook(sentMessage) {
   console.log('[Webhook] Promotion started — image sent');
 }
 
-function messageMatchesInterestTrigger(raw) {
-  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  if (!t) return false;
-  if (/\bwhat\s+is\s+(that|this)\b/.test(t)) return true;
-  if (/\bhow\s+do\s+i\s+get\s+that\b/.test(t)) return true;
-  if (/\bis\s+this\s+an\s+extension\b/.test(t)) return true;
-  return false;
+/**
+ * Cheap gate so we do not call Gemini on every channel message.
+ * @param {string} raw
+ * @param {boolean} replyToOutreach
+ */
+function shouldInvokeInterestClassifier(raw, replyToOutreach) {
+  if (replyToOutreach) return true;
+  const t = (raw || '').trim();
+  if (!t || t.length > 500) return false;
+  if (/\brobud\b/i.test(t)) return true;
+  if (/\b(browser\s+)?extension\b/i.test(t) && /\b(what|where|how|which|install|download|get|is|does|link)\b/i.test(t)) {
+    return true;
+  }
+  if (
+    /[?]/.test(t) &&
+    t.length < 320 &&
+    /\b(what|where|how|which|install|download|extension|link|that|this|it)\b/i.test(t)
+  ) {
+    return true;
+  }
+  return classifyProdInterestLegacyGate(t) != null;
 }
 
-async function messageIsReplyToOurPromo(message) {
-  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return false;
+/** Regex-only fallback when Gemini fails; also used as a sparse gate above. */
+function classifyProdInterestLegacyGate(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+
+  if (/\bis\s+this\s+an\s+extension\b/.test(t)) return 'extension';
+
+  if (
+    /\bwhat\s+is\s+(that|this|it|robud)\b/.test(t) ||
+    /\bwhat'?s\s+(that|this|it|robud)\b/.test(t) ||
+    /\bwhats\s+(that|this|it|robud)\b/.test(t)
+  ) {
+    return 'what';
+  }
+
+  if (
+    /\bwhat\s+(does|do)\s+(it|this|robud|that)\b/.test(t) ||
+    /\bhow\s+does\s+(it|this|robud)\s+work\b/.test(t)
+  ) {
+    return 'what_does';
+  }
+
+  if (
+    /\bhow\s+do\s+i\s+get\s+(that|this|it|robud)\b/.test(t) ||
+    /\bhow\s+can\s+i\s+get\b/.test(t) ||
+    /\bhow\s+to\s+get\b/.test(t) ||
+    /\bwhere\s+(do\s+i|can\s+i|to)\s+get\b/.test(t) ||
+    /\bwhere\s+can\s+i\s+get\b/.test(t) ||
+    /\bwhere\s+to\s+(get|download)\b/.test(t) ||
+    /\bwhere\s+.*\b(download|install)\b/.test(t) ||
+    /\bgot\s+(a\s+)?link\b/.test(t) ||
+    (/\b(install|download)\b/.test(t) && /\b(robud|extension|it|this)\b/.test(t))
+  ) {
+    return 'where';
+  }
+
+  return null;
+}
+
+/**
+ * Parse Gemini output: INTEREST: YES|NO and INTENT: WHAT_IS|WHAT_DOES|HOW_TO_GET|IS_EXTENSION|NONE
+ * @returns {'what' | 'what_does' | 'where' | 'extension' | null}
+ */
+function parseInterestIntentFromGeminiText(text) {
+  const raw = (text || '').trim();
+  if (!raw) return null;
+
+  const interestM = raw.match(/INTEREST:\s*(YES|NO)/i);
+  if (!interestM || String(interestM[1]).toUpperCase() !== 'YES') return null;
+
+  const intentM = raw.match(/INTENT:\s*(WHAT_IS|WHAT_DOES|HOW_TO_GET|IS_EXTENSION|NONE)/i);
+  if (!intentM) return null;
+
+  const intent = String(intentM[1]).toUpperCase();
+  if (intent === 'NONE') return null;
+  if (intent === 'WHAT_IS') return 'what';
+  if (intent === 'WHAT_DOES') return 'what_does';
+  if (intent === 'HOW_TO_GET') return 'where';
+  if (intent === 'IS_EXTENSION') return 'extension';
+  return null;
+}
+
+/**
+ * @returns {{ kind: 'what' | 'what_does' | 'where' | 'extension' | null, explicitNo: boolean }}
+ * explicitNo: model output clearly said INTEREST: NO (skip regex fallback).
+ */
+async function classifyInterestIntentWithGemini(userText, replyToOutreach) {
+  const snippet = (userText || '').trim().slice(0, 900);
+  const prompt = `You classify ONE Discord message. The product is a browser extension called "robud" (Roblox trading). Downstream, a separate step will send a very short, casual teenager-style reply — your job is ONLY to route intent correctly (not to write the reply).
+
+Context: reply_thread=${replyToOutreach ? 'yes' : 'no'} (if yes, they are likely replying to someone who mentioned robud or a promo).
+
+Message:
+${JSON.stringify(snippet)}
+
+Output EXACTLY two lines. No markdown, no quotes, no extra words.
+Line 1: INTEREST: YES or NO
+Line 2: INTENT: one of WHAT_IS | WHAT_DOES | HOW_TO_GET | IS_EXTENSION | NONE
+
+INTEREST YES when they are clearly trying to learn about robud / the promoted thing / the extension in a question or confused follow-up (including informal wording, typos, all caps, slang).
+INTEREST NO for: insults, pure off-topic, flexing "i already have it" with no question, jokes unrelated to robud, other games, spam, or statements that are not asking anything about robud/extension.
+
+INTENT (if INTEREST YES; if NO then INTENT: NONE):
+- WHAT_IS — identity / what is that / what is this / what's robud / what are you talking about (NOT "how do I install").
+- WHAT_DOES — what it does / how it works / why use it / does it help trades (functionality — not install location).
+- HOW_TO_GET — where to get, install, download, link, chrome web store, "how do i get it".
+- IS_EXTENSION — is it an extension / browser extension / do I download something (yes/no style confusion about type of product).
+
+If two intents apply, pick the PRIMARY one the user most urgently needs (e.g. combined "what is it and where do i get it" → usually HOW_TO_GET if install is explicit; if mostly identity → WHAT_IS).
+
+When unsure whether it's about robud at all: INTEREST: NO, INTENT: NONE.`;
+
+  for (const modelName of GEMINI_MODELS) {
+    try {
+      const model = getGeminiModel(modelName);
+      const result = await model.generateContent(prompt);
+      const t = extractTextFromGeminiResult(result, `interest-${modelName}`);
+      const parsed = parseInterestIntentFromGeminiText(t);
+      if (parsed) return { kind: parsed, explicitNo: false };
+      if (/\bINTEREST:\s*NO\b/i.test(t || '')) return { kind: null, explicitNo: true };
+    } catch (e) {
+      console.warn(`[Interest] Gemini classify error [${modelName}]:`, e.message || e);
+    }
+  }
+  return { kind: null, explicitNo: false };
+}
+
+function pickInterestReplyLine(kind) {
+  if (kind === 'extension') return pickRandom(INTEREST_REPLY_EXTENSION_CONFIRM_LINES);
+  if (kind === 'what') return pickRandom(INTEREST_REPLY_WHAT_IS_LINES);
+  if (kind === 'what_does') return pickRandom(INTEREST_REPLY_WHAT_IT_DOES_LINES);
+  if (kind === 'where') return pickRandom(INTEREST_REPLY_WHERE_LINES);
+  return null;
+}
+
+function interestIntentLabelForPrompt(kind) {
+  if (kind === 'what') return 'WHAT_IS';
+  if (kind === 'what_does') return 'WHAT_DOES';
+  if (kind === 'where') return 'HOW_TO_GET';
+  if (kind === 'extension') return 'IS_EXTENSION';
+  return 'NONE';
+}
+
+/** Take first non-empty line; strip code fences / quotes. */
+function normalizeGeneratedInterestReply(raw) {
+  if (raw == null) return '';
+  let s = String(raw).trim();
+  s = s.replace(/^```[a-z]*\s*/i, '').replace(/\s*```$/i, '').trim();
+  s = s.replace(/^["'`]+|["'`]+$/g, '').trim();
+  const line = s.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || '';
+  return line.slice(0, 280);
+}
+
+/**
+ * One short Discord reply in a teenager voice (not corporate / not “bot promo”).
+ * @param {'what'|'what_does'|'where'|'extension'} kind
+ */
+async function generateInterestTeenReplyWithGemini(kind, userText, replyToOutreach) {
+  const intent = interestIntentLabelForPrompt(kind);
+  const msg = (userText || '').trim().slice(0, 900);
+
+  const prompt = `You write ONE reply on Discord. You are a normal teenager (~15) in a Roblox trading server. Someone asked about "robud" (a browser extension). Your job is to answer in a way that sounds like a real kid typing — NOT customer support, NOT a brand, NOT an ad, NOT ChatGPT corporate tone.
+
+HARD RULES (breaking these is a failure):
+- Output EXACTLY ONE short message. No bullet points. No numbered lists. No multiple paragraphs. No "hope this helps". No "I'd be happy to".
+- MOSTLY lowercase. You may use "u" for you. Keep it brief (aim under ~18 words, never over ~25 words).
+- You MAY use "js" to mean "just" (Discord slang), e.g. "js search up robud…" or "its js called robud".
+- Do NOT sound excited/marketing: no "This is Robud!", no exclamation spam, no long product pitch.
+- Do NOT claim fancy features you were not told: NO "graphs and charts", NO "detailed AI analysis", NO "innovative", NO "comprehensive", NO "revolutionary", NO "powerful suite".
+- Do NOT paste links unless the user explicitly asked where to get it AND the intent is HOW_TO_GET / install — then you may say chrome web store / google in plain words (still casual). Prefer phrasing like "js search up robud on chrome webstore" / "lookup robud on chrome store" / "js lookup getrobud on google" — vary wording slightly but stay in the same vibe.
+- Match the INTENT category below — do not answer a different question than they asked.
+
+INTENT for this reply: ${intent}
+- WHAT_IS: they want to know what "it" / robud / that thing IS (name/identity only). Like "its js called robud". NOT a feature list.
+- WHAT_DOES: they want what it DOES. ONLY keep it to trade judgment framing, e.g. "just tells u if a trade is a w or l" or "tells u if a trade is good or not". Do NOT add extra product detail.
+- HOW_TO_GET: where to install / get it. Casual directions only (chrome web store / google). Examples of vibe: "js search up robud on chrome webstore", "lookup robud on chrome store", "js lookup getrobud on google".
+- IS_EXTENSION: confirm yeah it's a browser/chrome extension — one short line, same casual voice.
+
+Context: reply_thread=${replyToOutreach ? 'yes' : 'no'} (they may be replying to your earlier message).
+
+Their message:
+${JSON.stringify(msg)}
+
+Output ONLY the reply text. No quotes around it. No label like "Reply:". No markdown.`;
+
+  for (const modelName of GEMINI_MODELS) {
+    try {
+      const model = getGeminiModel(modelName);
+      const result = await model.generateContent(prompt);
+      const t = extractTextFromGeminiResult(result, `interest-reply-${modelName}`);
+      const line = normalizeGeneratedInterestReply(t);
+      const polished = polishReplyText(line);
+      if (polished && polished.length >= 3) return polished.slice(0, 280);
+    } catch (e) {
+      console.warn(`[Interest] Gemini reply gen error [${modelName}]:`, e.message || e);
+    }
+  }
+  return '';
+}
+
+async function messageIsReplyToOurOutreach(message) {
+  if (!isProdTargetChannel(message)) return false;
   const refId = message.reference?.messageId;
   if (!refId) return false;
   if (recentPromoMessageIds.includes(refId)) return true;
   try {
     const ref = await message.fetchReference().catch(() => null);
     if (!ref || ref.author?.id !== message.client.user?.id) return false;
-    return Boolean(ref.attachments?.size);
+    return true;
   } catch {
     return false;
   }
 }
 
-async function tryHandleProdInterestWebhook(message) {
+async function postProdInterestWebhook(message, kind, replyToOutreach) {
   if (!DISCORD_WEBHOOK_URL) return;
-  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
-  if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
-  if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return;
-  if (interestWebhookHandledIds.has(message.id)) return;
-
-  const phraseHit = messageMatchesInterestTrigger(message.content);
-  const replyToPromo = await messageIsReplyToOurPromo(message);
-  if (!phraseHit && !replyToPromo) return;
-
-  interestWebhookHandledIds.add(message.id);
-  if (interestWebhookHandledIds.size > 5000) interestWebhookHandledIds.clear();
 
   const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
   let avatar = '';
@@ -463,8 +676,16 @@ async function tryHandleProdInterestWebhook(message) {
   }
 
   const contextParts = [];
-  if (replyToPromo) contextParts.push('Reply to image promo');
-  if (phraseHit) contextParts.push('Trigger phrase');
+  if (replyToOutreach) contextParts.push('Reply to our outreach');
+  if (kind) {
+    const labels = {
+      what: 'What is it',
+      what_does: 'What it does',
+      where: 'How to get',
+      extension: 'Extension question'
+    };
+    contextParts.push(labels[kind] || kind);
+  }
   const contextLine = contextParts.length ? contextParts.join(' · ') : '—';
 
   const embed = {
@@ -503,6 +724,55 @@ async function tryHandleProdInterestWebhook(message) {
 
   await postDiscordWebhook({ embeds: [embed] });
   console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+}
+
+/**
+ * Uses Gemini to decide if the user is asking what robud is, what it does, or how to get it; then replies in-channel.
+ * Optional webhook when DISCORD_WEBHOOK_URL is set.
+ */
+async function tryHandleProdInterest(message) {
+  if (!isProdTargetChannel(message)) return false;
+  if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return false;
+  if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return false;
+  if (promoGateIsOnline) return false;
+  if (prodInterestHandledIds.has(message.id)) return false;
+
+  const replyToOutreach = await messageIsReplyToOurOutreach(message);
+  if (!shouldInvokeInterestClassifier(message.content, replyToOutreach)) return false;
+
+  const gemini = await classifyInterestIntentWithGemini(message.content, replyToOutreach);
+  let kind = gemini.kind;
+  if (!kind && !gemini.explicitNo) {
+    kind = classifyProdInterestLegacyGate(message.content);
+  }
+  if (!kind) return false;
+
+  prodInterestHandledIds.add(message.id);
+  if (prodInterestHandledIds.size > 5000) prodInterestHandledIds.clear();
+
+  let line = await generateInterestTeenReplyWithGemini(kind, message.content, replyToOutreach);
+  if (!line) line = pickInterestReplyLine(kind);
+  if (!line) return true;
+
+  const ch = message.channel;
+  const delay =
+    ch && typeof ch.rateLimitPerUser === 'number' ? replyDelayMs(ch) : DEFAULT_REPLY_DELAY_MS;
+  await sleep(delay);
+
+  if (!isProdTargetChannel(message)) {
+    console.warn('[Interest] Skipped send — message not in prod guild/channel');
+    return true;
+  }
+  try {
+    const sent = await message.reply(line);
+    rememberPromoMessageId(sent.id);
+    console.log(`[Interest] In-channel reply → ${message.author.tag} (${kind}${replyToOutreach ? ', reply thread' : ''})`);
+  } catch (e) {
+    console.warn('[Interest] Reply failed:', e.message || e);
+  }
+
+  await postProdInterestWebhook(message, kind, replyToOutreach);
+  return true;
 }
 
 async function postOptionalChatWatchWebhook({
@@ -805,7 +1075,7 @@ async function tryHandleProdCannedReplyPromo(message) {
   if (!ENABLE_PROD_CANNED_REPLY_PROMOS) return false;
   if (ENABLE_PROD_WL_REPLIES) return false;
   if (!imageAdvertEverSent) return false;
-  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return false;
+  if (!isProdTargetChannel(message)) return false;
   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) {
     return false;
   }
@@ -850,7 +1120,12 @@ async function tryHandleProdCannedReplyPromo(message) {
 
   const line = pickRandom(CANNED_ROBUD_REPLIES);
   try {
-    await message.reply(line);
+    if (!isProdTargetChannel(message)) {
+      console.warn('[Reply promo] Skipped send — not prod channel');
+      return false;
+    }
+    const sent = await message.reply(line);
+    rememberPromoMessageId(sent.id);
     cannedRepliesSentThisImageInterval++;
     lastCannedReplyAtSerial = prodChannelMessageSerial;
     cannedReplyNudgedUserIds.add(message.author.id);
@@ -1171,9 +1446,7 @@ function replyDelayMs(channel) {
 
 async function tryHandleProdWlChannel(message) {
   if (!ENABLE_PROD_WL_REPLIES) return false;
-  const guildId = message.guild?.id;
-  const channelId = message.channel?.id;
-  if (guildId !== PROD_GUILD_ID || channelId !== PROD_CHANNEL_ID) return false;
+  if (!isProdTargetChannel(message)) return false;
   if (message.author.id === message.client.user.id || message.author.bot) return false;
   if (promoGateIsOnline) return false;
 
@@ -1237,7 +1510,12 @@ async function tryHandleProdWlChannel(message) {
   if (!safe) return true;
 
   try {
-    await message.reply(safe);
+    if (!isProdTargetChannel(message)) {
+      console.warn('[Prod W/L] Skipped send — not prod channel');
+      return true;
+    }
+    const sent = await message.reply(safe);
+    rememberPromoMessageId(sent.id);
     console.log(`[Prod W/L] Nudge sent (${safe.length} chars)`);
   } catch (e) {
     console.warn('[Prod W/L] Reply failed:', e.message || e);
@@ -1272,8 +1550,7 @@ client.on('messageCreate', async (message) => {
     appendChatWatchSample(message);
 
     if (
-      message.channel?.id === PROD_CHANNEL_ID &&
-      message.guild?.id === PROD_GUILD_ID &&
+      isProdTargetChannel(message) &&
       message.author?.id &&
       message.author.id !== message.client.user.id &&
       !message.author.bot
@@ -1282,7 +1559,7 @@ client.on('messageCreate', async (message) => {
       prodChannelMessageSerial++;
     }
 
-    await tryHandleProdInterestWebhook(message);
+    if (await tryHandleProdInterest(message)) return;
 
     if (await tryHandleProdCannedReplyPromo(message)) return;
     if (await tryHandleProdWlChannel(message)) return;
@@ -1293,6 +1570,9 @@ client.on('messageCreate', async (message) => {
 
 client.on('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log(
+    `[Scope] Auto-replies + promos are locked to guild ${PROD_GUILD_ID} · channel ${PROD_CHANNEL_ID}`
+  );
   botReadyAt = Date.now();
   console.log(
     `[Chat watch] Initial ${CHAT_WATCH_DURATION_MS / 60000}m sample on <#${PROD_CHANNEL_ID}> — then each promo is preceded by another ${CHAT_WATCH_DURATION_MS / 60000}m sample when cadence allows.`
