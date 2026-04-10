@@ -34,20 +34,26 @@ const CHAT_WATCH_DURATION_MS = 5 * 60 * 1000;
 
 /**
  * If the prod sample has at least this many messages in CHAT_WATCH_DURATION_MS, treat chat as "fast":
- * promos are capped at once per hour only (no 300-message trigger).
+ * promos are capped at once per hour only (no 600-message shortcut).
  * ~75 msgs / 5 min ~= same bar as ~30 msgs / 2 min (~15 msgs/min).
  */
 const CHAT_FAST_THRESHOLD_MESSAGES = 75;
+
+/**
+ * Normal tier: fewer than this many msgs in the 5-min sample ⇒ "slow" — message-volume promo rules apply.
+ * Otherwise (still below fast tier) ⇒ hourly timer only; no prod message count shortcut.
+ */
+const CHAT_SLOW_THRESHOLD_MESSAGES = 25;
 
 /** All promos (image + reply) post in PROD_CHANNEL_ID below. Promos pause while this user is online in PROD_GUILD_ID. */
 const PROMO_GATE_USERNAME = (process.env.PROMO_GATE_USERNAME || 'johnwall.12').trim().toLowerCase();
 
 const POLL_INTERVAL_MS = 30_000;
 
-/** Promo spacing when prod chat is NOT in the fast tier: 1 h OR volume, with slow-night carve-out. */
+/** Minimum time between promos when using timer-only paths (fast tier, or normal non-slow). */
 const ADVERT_INTERVAL_MS = 60 * 60 * 1000;
-const ADVERT_MESSAGES_VOLUME = 300;
-const ADVERT_MESSAGES_SLOW_MIN = 150;
+const ADVERT_MESSAGES_VOLUME = 600;
+const ADVERT_MESSAGES_SLOW_MIN = 300;
 
 /** Optional: Discord user id for promo gate — set if username lookup fails. */
 const PROMO_GATE_USER_ID = (process.env.PROMO_GATE_USER_ID || '').trim();
@@ -190,6 +196,8 @@ let chatWatchBuffer = [];
 let promotionTierReady = false;
 /** From last sample: true = fast prod chat → hourly promos only. */
 let promoProdIsFastChat = false;
+/** From last sample: normal tier and "slow" 5-min window → volume + 1h+floor rules; false ⇒ timer only. */
+let promoProdIsSlowChat = false;
 let botReadyAt = 0;
 
 let cachedAdvertChannel = null;
@@ -300,7 +308,7 @@ ${JSON.stringify(report, null, 2)}
 Write 2-5 short sentences:
 1) Overall how active was chat (dead / quiet / moderate / busy / very fast) using the message count and the ${report.windowSeconds}s window.
 2) Typical pacing — e.g. messages roughly every second, few seconds, tens of seconds, around a minute, etc. Use median and average gap when helpful; mention if gaps are very uneven (bursts vs long pauses) using min vs max.
-3) One short sentence tying activity to promoTier: if promoTier is "fast", note that promos should stay sparse (hourly); if "normal", time-or-message rules apply.
+3) One short sentence: if promoTier is "fast", hourly-only promos; if "normal" and promoChatSlow is true, volume-or-time rules; if "normal" and not slow, hourly timer only (no message threshold).
 4) Keep it factual; no need to invent reasons.
 
 Plain text only, no markdown.`;
@@ -575,10 +583,14 @@ async function runChatWatchReport() {
   };
 
   const isFastTier = report.messageCount >= CHAT_FAST_THRESHOLD_MESSAGES;
+  const isSlowCadence = !isFastTier && report.messageCount < CHAT_SLOW_THRESHOLD_MESSAGES;
   report.promoTier = isFastTier ? 'fast' : 'normal';
+  report.promoChatSlow = isSlowCadence;
   report.promoTierExplanation = isFastTier
     ? `Fast prod chat (>=${CHAT_FAST_THRESHOLD_MESSAGES} msgs in ${report.windowSeconds}s): image promos capped at once per ${ADVERT_INTERVAL_MS / 3600000} hour only.`
-    : `Normal prod chat: adverts allowed after ${ADVERT_MESSAGES_VOLUME} prod msgs since last advert, OR after ${ADVERT_INTERVAL_MS / 3600000}h plus at least ${ADVERT_MESSAGES_SLOW_MIN} prod msgs if chat is slow.`;
+    : isSlowCadence
+      ? `Normal prod chat (slow: <${CHAT_SLOW_THRESHOLD_MESSAGES} msgs / ${report.windowSeconds}s): next promo after ${ADVERT_MESSAGES_VOLUME} prod msgs since last, OR ${ADVERT_INTERVAL_MS / 3600000}h + ≥${ADVERT_MESSAGES_SLOW_MIN} msgs.`
+      : `Normal prod chat (not slow): image promos on a ${ADVERT_INTERVAL_MS / 3600000}h timer only — no message-count shortcut.`;
 
   console.log('[Chat watch] Computed report:', JSON.stringify(report, null, 2));
 
@@ -586,7 +598,9 @@ async function runChatWatchReport() {
 
   const promoCadenceBlurb = isFastTier
     ? `Fast prod chat (${report.messageCount} ≥ ${CHAT_FAST_THRESHOLD_MESSAGES} in ${report.windowSeconds}s) → image promos in ${PROD_CHANNEL_ID} only every ${ADVERT_INTERVAL_MS / 3600000}h (no ${ADVERT_MESSAGES_VOLUME}-message shortcut).`
-    : `Normal prod chat (${report.messageCount} < ${CHAT_FAST_THRESHOLD_MESSAGES}) → ${ADVERT_MESSAGES_VOLUME} prod msgs since last advert OR ${ADVERT_INTERVAL_MS / 3600000}h + ≥${ADVERT_MESSAGES_SLOW_MIN} msgs if slow.`;
+    : isSlowCadence
+      ? `Normal slow (${report.messageCount} < ${CHAT_SLOW_THRESHOLD_MESSAGES} in ${report.windowSeconds}s) → ${ADVERT_MESSAGES_VOLUME} prod msgs since last OR ${ADVERT_INTERVAL_MS / 3600000}h + ≥${ADVERT_MESSAGES_SLOW_MIN} msgs.`
+      : `Normal active (${report.messageCount} ≥ ${CHAT_SLOW_THRESHOLD_MESSAGES}, <${CHAT_FAST_THRESHOLD_MESSAGES}) → promos every ${ADVERT_INTERVAL_MS / 3600000}h only.`;
 
   const gapLine = gapStats
     ? `avg ${(gapStats.avg / 1000).toFixed(1)}s · med ${(gapStats.med / 1000).toFixed(1)}s · min ${(gapStats.min / 1000).toFixed(1)}s · max ${(gapStats.max / 1000).toFixed(1)}s`
@@ -618,12 +632,15 @@ async function runChatWatchReport() {
   });
 
   promoProdIsFastChat = isFastTier;
+  promoProdIsSlowChat = isSlowCadence;
   promotionTierReady = true;
   console.log(
     `[Promo] Prod sample done — ${report.messageCount} msgs / ${report.windowSeconds}s → ` +
       (promoProdIsFastChat
         ? `FAST tier (promos: ${ADVERT_INTERVAL_MS / 3600000}h only)`
-        : `NORMAL tier (${ADVERT_MESSAGES_VOLUME} prod msgs or ${ADVERT_INTERVAL_MS / 3600000}h + ${ADVERT_MESSAGES_SLOW_MIN} msgs when slow)`)
+        : promoProdIsSlowChat
+          ? `NORMAL SLOW (${ADVERT_MESSAGES_VOLUME} msgs or ${ADVERT_INTERVAL_MS / 3600000}h + ${ADVERT_MESSAGES_SLOW_MIN})`
+          : `NORMAL ACTIVE (${ADVERT_INTERVAL_MS / 3600000}h timer only)`)
   );
 
   await trySendAdvertAfterSample();
@@ -675,7 +692,17 @@ function canSendAdvertByCadence() {
       }
       return { ok: true, reason: 'fast prod chat: first promo (1h since bot ready)' };
     }
-    return { ok: true, reason: 'normal prod chat: first promo' };
+    if (!promoProdIsSlowChat) {
+      const since = Date.now() - botReadyAt;
+      if (since < ADVERT_INTERVAL_MS) {
+        return {
+          ok: false,
+          reason: `normal active chat: first promo in ${Math.ceil((ADVERT_INTERVAL_MS - since) / 60000)} min`
+        };
+      }
+      return { ok: true, reason: 'normal active chat: first promo (1h since bot ready)' };
+    }
+    return { ok: true, reason: 'normal slow chat: first promo' };
   }
 
   const msgs = advertProdMessagesSinceSend;
@@ -691,26 +718,37 @@ function canSendAdvertByCadence() {
     return { ok: true, reason: 'fast prod chat: 1h since last promo' };
   }
 
+  if (!promoProdIsSlowChat) {
+    const elapsed = Date.now() - lastAdvertSentAt;
+    if (elapsed < ADVERT_INTERVAL_MS) {
+      return {
+        ok: false,
+        reason: `normal active chat: next promo in ${Math.ceil((ADVERT_INTERVAL_MS - elapsed) / 60000)} min`
+      };
+    }
+    return { ok: true, reason: 'normal active chat: 1h since last promo' };
+  }
+
   if (msgs >= ADVERT_MESSAGES_VOLUME) {
-    return { ok: true, reason: `${ADVERT_MESSAGES_VOLUME}+ msgs in prod since last promo` };
+    return { ok: true, reason: `normal slow chat: ${ADVERT_MESSAGES_VOLUME}+ msgs since last promo` };
   }
 
   const elapsed = Date.now() - lastAdvertSentAt;
   if (elapsed < ADVERT_INTERVAL_MS) {
     return {
       ok: false,
-      reason: `wait ${Math.ceil((ADVERT_INTERVAL_MS - elapsed) / 60000)} min or ${ADVERT_MESSAGES_VOLUME - msgs} more prod msgs`
+      reason: `normal slow chat: wait ${Math.ceil((ADVERT_INTERVAL_MS - elapsed) / 60000)} min or ${ADVERT_MESSAGES_VOLUME - msgs} more prod msgs`
     };
   }
 
   if (msgs < ADVERT_MESSAGES_SLOW_MIN) {
     return {
       ok: false,
-      reason: `hour passed but prod chat slow (${msgs}/${ADVERT_MESSAGES_SLOW_MIN} msgs since last promo)`
+      reason: `normal slow chat: hour up but still too quiet (${msgs}/${ADVERT_MESSAGES_SLOW_MIN} msgs since last promo)`
     };
   }
 
-  return { ok: true, reason: `normal: ${ADVERT_INTERVAL_MS / 3600000}h + ${msgs} prod msgs` };
+  return { ok: true, reason: `normal slow chat: ${ADVERT_INTERVAL_MS / 3600000}h + ${msgs} prod msgs` };
 }
 
 function noteAdvertSent() {
