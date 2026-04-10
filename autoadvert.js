@@ -121,9 +121,18 @@ const ROBUD_REPLY_STYLE_GUIDE = [
   'the product name is robud (lowercase)',
   'robud is a browser extension for Roblox trading — values, w/l style help, less screenshot spam',
   `install link when relevant: ${ROBUD_INFO_URL}`,
-  'tone: short discord message, casual, lowercase ok, no walls of text',
-  'do not claim features you are not sure of; keep it simple'
+  'write like a real person on Discord: quick, informal, no corporate or assistant voice, no bullet lists, no "I hope this helps"',
+  'prefer one or two short lines; if you include the link, put the url alone on the last line',
+  'lowercase is fine; skip fancy punctuation; do not claim features you are not sure of'
 ];
+/**
+ * Same voice as the pre-Gemini static reply — used for short "what is this?" style promo replies
+ * so those stay identical; Gemini still classifies interest and handles nuanced follow-ups.
+ */
+const ROBUD_INTEREST_CANONICAL_REPLY = (
+  process.env.ROBUD_INTEREST_CANONICAL_REPLY ||
+  `robud is a roblox trade helper browser extension — in-game values and w/l stuff without posting screenshots here\n${ROBUD_INFO_URL}`
+).trim();
 /** If Gemini fails, append this after the first guide line + URL. */
 const ROBUD_INTEREST_FALLBACK_REPLY = (
   process.env.ROBUD_INTEREST_FALLBACK_REPLY ||
@@ -468,6 +477,17 @@ function userIsRobudInterested(uid) {
 /**
  * Loose pre-filter so we do not call Gemini on every prod line — Gemini still decides real interest.
  */
+/** Short vague identity questions on a promo thread → use ROBUD_INTEREST_CANONICAL_REPLY (old static voice). */
+function isVaguePromoIdentityQuestion(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 100) return false;
+  if (/\bwhat\s+is\s+(this|that|it)\b/.test(t)) return true;
+  if (/\bwhat('?s| is)\s+that\b/.test(t)) return true;
+  if (/\bwhat\s+are\s+you\s+(showing|posting)\b/.test(t)) return true;
+  if (/\bwhat\s+extension\b/.test(t) && t.length < 80) return true;
+  return false;
+}
+
 function messageMaybeRobudRelatedColdScan(raw) {
   const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!t) return false;
@@ -540,7 +560,11 @@ Respond with JSON ONLY, no markdown, no extra keys:
 {"interested": true or false, "replyText": "string — empty if not interested", "contextNote": "brief label for logs e.g. promo_reply_question"}
 
 If interested is false, replyText must be "".
-If interested is true, replyText must be 1-4 short lines (under 500 characters), helpful, and follow the style rules. Include the install link when talking about how to get it.`;
+If interested is true, replyText must be 1-4 short lines (under 500 characters), helpful, and follow the style rules. Include the install link when talking about how to get it.
+
+Example of the target voice (do not copy verbatim unless the user message is a vague "what is this" on the promo — the script may substitute a fixed reply for that case):
+"robud is a roblox trade helper browser extension — in-game values and w/l stuff without posting screenshots here"
+then newline then the chrome web store url`;
 
   for (let attempt = 0; attempt < GEMINI_RETRIES; attempt++) {
     for (const modelName of GEMINI_MODELS) {
@@ -633,6 +657,11 @@ async function tryHandleProdUserInterest(message) {
 
   robudInterestedUserLastSeen.set(message.author.id, Date.now());
 
+  const useCanonicalPromoReply =
+    replyToPromo &&
+    isVaguePromoIdentityQuestion(message.content) &&
+    Boolean(ROBUD_INTEREST_CANONICAL_REPLY);
+
   if (DISCORD_WEBHOOK_URL) {
     const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
     let avatar = '';
@@ -648,6 +677,7 @@ async function tryHandleProdUserInterest(message) {
     const contextParts = [];
     if (replyToPromo) contextParts.push('Reply to image promo');
     if (alreadyInterested) contextParts.push('Follow-up (known interested)');
+    if (useCanonicalPromoReply) contextParts.push('Fixed voice (vague promo question)');
     if (gemini.contextNote) contextParts.push(gemini.contextNote);
     const contextLine = contextParts.length ? contextParts.join(' · ') : 'Gemini: interested';
 
@@ -693,7 +723,8 @@ async function tryHandleProdUserInterest(message) {
     }
   }
 
-  await trySendProdGeminiInterestReply(message, gemini.replyText);
+  const replyBody = useCanonicalPromoReply ? ROBUD_INTEREST_CANONICAL_REPLY : gemini.replyText;
+  await trySendProdGeminiInterestReply(message, replyBody);
 }
 
 async function postOptionalChatWatchWebhook({
