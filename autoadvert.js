@@ -90,6 +90,15 @@ const CANNED_ROBUD_REPLIES = [
   'just get robud instead of sending w/ls'
 ];
 
+/** Casual one-liners when someone asks what the promo is — same energy as CANNED_ROBUD_REPLIES, then link on next line. */
+const ROBUD_INTEREST_VAGUE_PROMO_LINES = [
+  'its robud js a chrome ext for roblox trades / values n w l stuff',
+  'oh thats robud browser extension for trading n values ingame',
+  'robud lol its for roblox trading w l type stuff',
+  'js robud — ext that helps w trades and values',
+  'its called robud chrome ext for roblox trade stuff'
+];
+
 /**
  * Real server W/L trade-image nudges — off unless you enable.
  */
@@ -118,26 +127,19 @@ const ROBUD_INTEREST_USER_TTL_MS = Number(process.env.ROBUD_INTEREST_USER_TTL_MS
  * Edit this list; it is injected into the Gemini prompt.
  */
 const ROBUD_REPLY_STYLE_GUIDE = [
-  'the product name is robud (lowercase)',
-  'robud is a browser extension for Roblox trading — values, w/l style help, less screenshot spam',
-  `install link when relevant: ${ROBUD_INFO_URL}`,
-  'write like a real person on Discord: quick, informal, no corporate or assistant voice, no bullet lists, no "I hope this helps"',
-  'prefer one or two short lines; if you include the link, put the url alone on the last line',
-  'lowercase is fine; skip fancy punctuation; do not claim features you are not sure of'
+  'product is robud (lowercase) — chrome extension for roblox trading / values / w l',
+  'match the voice of casual Discord: very short, messy, lowercase ok, "js" for just, "u" ok, no marketing sentences',
+  'never sound like a bot, FAQ, or customer support — no em dashes, no "in-game" corporate phrasing, no "hope this helps"',
+  `if they need the install link, end with the url on its own last line: ${ROBUD_INFO_URL}`,
+  'one or two lines of body text max before the url line; do not list features like a product page'
 ];
 /**
- * Same voice as the pre-Gemini static reply — used for short "what is this?" style promo replies
- * so those stay identical; Gemini still classifies interest and handles nuanced follow-ups.
+ * Optional: force one exact reply for vague promo questions (full message including url if you want).
+ * If unset, a random line from ROBUD_INTEREST_VAGUE_PROMO_LINES + newline + store url.
  */
-const ROBUD_INTEREST_CANONICAL_REPLY = (
-  process.env.ROBUD_INTEREST_CANONICAL_REPLY ||
-  `robud is a roblox trade helper browser extension — in-game values and w/l stuff without posting screenshots here\n${ROBUD_INFO_URL}`
-).trim();
-/** If Gemini fails, append this after the first guide line + URL. */
-const ROBUD_INTEREST_FALLBACK_REPLY = (
-  process.env.ROBUD_INTEREST_FALLBACK_REPLY ||
-  `its robud — roblox trade helper browser extension\n${ROBUD_INFO_URL}`
-).trim();
+const ROBUD_INTEREST_CANONICAL_REPLY = (process.env.ROBUD_INTEREST_CANONICAL_REPLY || '').trim();
+/** If Gemini fails entirely, random casual line + link (override full text with ROBUD_INTEREST_FALLBACK_REPLY). */
+const ROBUD_INTEREST_FALLBACK_REPLY = (process.env.ROBUD_INTEREST_FALLBACK_REPLY || '').trim();
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
@@ -203,6 +205,16 @@ function polishReplyText(s) {
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function buildVaguePromoInterestReply() {
+  if (ROBUD_INTEREST_CANONICAL_REPLY) return ROBUD_INTEREST_CANONICAL_REPLY;
+  return `${pickRandom(ROBUD_INTEREST_VAGUE_PROMO_LINES)}\n${ROBUD_INFO_URL}`;
+}
+
+function buildInterestFallbackReply() {
+  if (ROBUD_INTEREST_FALLBACK_REPLY) return ROBUD_INTEREST_FALLBACK_REPLY;
+  return `${pickRandom(ROBUD_INTEREST_VAGUE_PROMO_LINES)}\n${ROBUD_INFO_URL}`;
 }
 
 function sleep(ms) {
@@ -477,7 +489,7 @@ function userIsRobudInterested(uid) {
 /**
  * Loose pre-filter so we do not call Gemini on every prod line — Gemini still decides real interest.
  */
-/** Short vague identity questions on a promo thread → use ROBUD_INTEREST_CANONICAL_REPLY (old static voice). */
+/** Short vague identity questions on a promo thread → casual fixed reply (same vibe as CANNED_ROBUD_REPLIES), not Gemini paraphrase. */
 function isVaguePromoIdentityQuestion(raw) {
   const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!t || t.length > 100) return false;
@@ -560,11 +572,9 @@ Respond with JSON ONLY, no markdown, no extra keys:
 {"interested": true or false, "replyText": "string — empty if not interested", "contextNote": "brief label for logs e.g. promo_reply_question"}
 
 If interested is false, replyText must be "".
-If interested is true, replyText must be 1-4 short lines (under 500 characters), helpful, and follow the style rules. Include the install link when talking about how to get it.
+If interested is true, replyText must be under 400 characters, 1-2 short lines of messy casual text, then if they need the link add a newline and the chrome web store url alone on the last line. Sound like a normal user typing fast, not a product description.
 
-Example of the target voice (do not copy verbatim unless the user message is a vague "what is this" on the promo — the script may substitute a fixed reply for that case):
-"robud is a roblox trade helper browser extension — in-game values and w/l stuff without posting screenshots here"
-then newline then the chrome web store url`;
+Good voice examples (do not repeat verbatim): "js robud chrome ext for trades n values" / "its robud lol helps w w l stuff" / "oh thats robud u can grab it here" + url`;
 
   for (let attempt = 0; attempt < GEMINI_RETRIES; attempt++) {
     for (const modelName of GEMINI_MODELS) {
@@ -601,7 +611,7 @@ async function trySendProdGeminiInterestReply(message, replyBody) {
   await sleep(delay);
 
   let safe = (replyBody || '').trim().slice(0, 1990);
-  if (!safe) safe = ROBUD_INTEREST_FALLBACK_REPLY.slice(0, 1990);
+  if (!safe) safe = buildInterestFallbackReply().slice(0, 1990);
 
   try {
     await message.reply(safe);
@@ -657,10 +667,8 @@ async function tryHandleProdUserInterest(message) {
 
   robudInterestedUserLastSeen.set(message.author.id, Date.now());
 
-  const useCanonicalPromoReply =
-    replyToPromo &&
-    isVaguePromoIdentityQuestion(message.content) &&
-    Boolean(ROBUD_INTEREST_CANONICAL_REPLY);
+  const useCasualVaguePromoReply =
+    replyToPromo && isVaguePromoIdentityQuestion(message.content);
 
   if (DISCORD_WEBHOOK_URL) {
     const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
@@ -677,7 +685,7 @@ async function tryHandleProdUserInterest(message) {
     const contextParts = [];
     if (replyToPromo) contextParts.push('Reply to image promo');
     if (alreadyInterested) contextParts.push('Follow-up (known interested)');
-    if (useCanonicalPromoReply) contextParts.push('Fixed voice (vague promo question)');
+    if (useCasualVaguePromoReply) contextParts.push('Casual fixed (vague promo question)');
     if (gemini.contextNote) contextParts.push(gemini.contextNote);
     const contextLine = contextParts.length ? contextParts.join(' · ') : 'Gemini: interested';
 
@@ -723,7 +731,7 @@ async function tryHandleProdUserInterest(message) {
     }
   }
 
-  const replyBody = useCanonicalPromoReply ? ROBUD_INTEREST_CANONICAL_REPLY : gemini.replyText;
+  const replyBody = useCasualVaguePromoReply ? buildVaguePromoInterestReply() : gemini.replyText;
   await trySendProdGeminiInterestReply(message, replyBody);
 }
 
