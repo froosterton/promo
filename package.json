@@ -1,0 +1,25 @@
+{
+  "name": "autoadvert",
+  "version": "1.0.0",
+  "description": "Discord selfbot: prod chat sampling, Gemini, test-channel image promos, optional robud nudges",
+  "main": "autoadvert.js",
+  "scripts": {
+    "start": "node autoadvert.js",
+    "dev": "node autoadvert.js"
+  },
+  "keywords": [
+    "discord",
+    "roblox",
+    "gemini",
+    "promo"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "discord.js-selfbot-v13": "^3.7.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
