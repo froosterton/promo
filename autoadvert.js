@@ -100,6 +100,21 @@ const PROD_ROBUD_MIN_VALUE = 50_000;
 /** If slowmode is off, wait this long before auto-replying on prod nudges (ms). */
 const DEFAULT_REPLY_DELAY_MS = 5000;
 
+/**
+ * After a promo reply or interest trigger phrase, reply in-channel with what robud is (separate from webhook ping).
+ * Set ENABLE_PROD_INTEREST_INFO_REPLIES=0 to disable.
+ */
+const ENABLE_PROD_INTEREST_INFO_REPLIES = process.env.ENABLE_PROD_INTEREST_INFO_REPLIES !== '0';
+const PROD_INTEREST_REPLY_COOLDOWN_MS = Number(process.env.PROD_INTEREST_REPLY_COOLDOWN_MS) || 3 * 60 * 1000;
+const ROBUD_INFO_URL = (
+  process.env.ROBUD_INFO_URL ||
+  'https://chromewebstore.google.com/detail/robud-roblox-trade-helper/plheomohlllkkidlhlebdaibdpkognop'
+).trim();
+const ROBUD_INTEREST_REPLY_TEXT = (
+  process.env.ROBUD_INTEREST_REPLY ||
+  `robud is a roblox trade helper browser extension — in-game values and w/l stuff without posting screenshots here\n${ROBUD_INFO_URL}`
+).trim();
+
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
 const GEMINI_RETRIES = 3;
@@ -227,6 +242,8 @@ let promoImageRotate = 0;
 let lastWebhookPromoGateOnline = undefined;
 
 const interestWebhookHandledIds = new Set();
+/** Last time we sent an in-channel robud info reply per user (interest flow). */
+const prodInterestLastReplyByUserId = new Map();
 
 /** Recent image promo message IDs (this session) — used to detect replies. */
 const RECENT_PROMO_MESSAGE_IDS_CAP = 15;
@@ -417,10 +434,53 @@ async function emitPromotionStartedWebhook(sentMessage) {
 function messageMatchesInterestTrigger(raw) {
   const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!t) return false;
-  if (/\bwhat\s+is\s+(that|this)\b/.test(t)) return true;
-  if (/\bhow\s+do\s+i\s+get\s+that\b/.test(t)) return true;
-  if (/\bis\s+this\s+an\s+extension\b/.test(t)) return true;
+  if (/\bwhat\s+is\s+(that|this|it)\b/.test(t)) return true;
+  if (/\bwhat('?s| is)\s+robud\b/.test(t)) return true;
+  if (/\bwhat\s+(extension|plugin)\s+(is\s+)?(that|this|it)\b/.test(t)) return true;
+  if (/\bhow\s+do\s+i\s+get\s+(that|this|it|robud)\b/.test(t)) return true;
+  if (/\bwhere\s+(do\s+i\s+)?(get|download|install)\s+(that|this|it|robud|the\s+extension)\b/.test(t)) {
+    return true;
+  }
+  if (/\bis\s+this\s+an?\s+extension\b/.test(t)) return true;
+  if (/\bis\s+that\s+an?\s+extension\b/.test(t)) return true;
   return false;
+}
+
+/** Promo-thread reply without a full trigger phrase — only auto-explain robud if it looks like a real question. */
+function messageLooksLikePromoFollowUpQuestion(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/\?/.test(t)) return true;
+  if (/\bwhat\b/.test(t) && /\b(that|this|it|extension|plugin|robud)\b/.test(t)) return true;
+  if (/\bhow\s+(do|can|does)\b/.test(t)) return true;
+  if (/\bwhere\s+(do|can|is)\b/.test(t)) return true;
+  if (/\bwhich\s+extension\b/.test(t)) return true;
+  return false;
+}
+
+async function trySendProdInterestInfoReply(message) {
+  if (!ENABLE_PROD_INTEREST_INFO_REPLIES) return;
+  if (promoGateIsOnline) return;
+  if (!ROBUD_INTEREST_REPLY_TEXT) return;
+
+  const uid = message.author.id;
+  const last = prodInterestLastReplyByUserId.get(uid) || 0;
+  if (Date.now() - last < PROD_INTEREST_REPLY_COOLDOWN_MS) return;
+
+  const ch = await message.client.channels
+    .fetch(PROD_CHANNEL_ID, { force: true })
+    .catch(() => null);
+  const delay = ch ? replyDelayMs(ch) : DEFAULT_REPLY_DELAY_MS;
+  await sleep(delay);
+
+  const safe = ROBUD_INTEREST_REPLY_TEXT.slice(0, 1990);
+  try {
+    await message.reply(safe);
+    prodInterestLastReplyByUserId.set(uid, Date.now());
+    console.log(`[Interest reply] → ${message.author.tag}`);
+  } catch (e) {
+    console.warn('[Interest reply] Failed:', e.message || e);
+  }
 }
 
 async function messageIsReplyToOurPromo(message) {
@@ -437,8 +497,7 @@ async function messageIsReplyToOurPromo(message) {
   }
 }
 
-async function tryHandleProdInterestWebhook(message) {
-  if (!DISCORD_WEBHOOK_URL) return;
+async function tryHandleProdUserInterest(message) {
   if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
   if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return;
@@ -451,58 +510,69 @@ async function tryHandleProdInterestWebhook(message) {
   interestWebhookHandledIds.add(message.id);
   if (interestWebhookHandledIds.size > 5000) interestWebhookHandledIds.clear();
 
-  const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
-  let avatar = '';
-  try {
-    avatar =
-      typeof message.author.displayAvatarURL === 'function'
-        ? message.author.displayAvatarURL({ dynamic: true, size: 256 })
-        : '';
-  } catch {
-    avatar = '';
+  if (DISCORD_WEBHOOK_URL) {
+    const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
+    let avatar = '';
+    try {
+      avatar =
+        typeof message.author.displayAvatarURL === 'function'
+          ? message.author.displayAvatarURL({ dynamic: true, size: 256 })
+          : '';
+    } catch {
+      avatar = '';
+    }
+
+    const contextParts = [];
+    if (replyToPromo) contextParts.push('Reply to image promo');
+    if (phraseHit) contextParts.push('Trigger phrase');
+    const contextLine = contextParts.length ? contextParts.join(' · ') : '—';
+
+    const embed = {
+      title: 'User interested',
+      url: jump,
+      color: 0x57f287,
+      author: {
+        name: message.author.tag,
+        ...(avatar ? { icon_url: avatar } : {})
+      },
+      ...(avatar ? { thumbnail: { url: avatar } } : {}),
+      fields: [
+        {
+          name: 'Username',
+          value: message.author.tag,
+          inline: true
+        },
+        {
+          name: 'Context',
+          value: contextLine.slice(0, 256),
+          inline: true
+        },
+        {
+          name: 'Message',
+          value: (message.content || '(no text)').slice(0, 900) || '—',
+          inline: false
+        },
+        {
+          name: 'Jump',
+          value: `[Open message](${jump})`,
+          inline: false
+        }
+      ],
+      timestamp: new Date().toISOString()
+    };
+
+    try {
+      await postDiscordWebhook({ embeds: [embed] });
+      console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+    } catch (e) {
+      console.warn('[Webhook] Interest ping failed:', e.message || e);
+    }
   }
 
-  const contextParts = [];
-  if (replyToPromo) contextParts.push('Reply to image promo');
-  if (phraseHit) contextParts.push('Trigger phrase');
-  const contextLine = contextParts.length ? contextParts.join(' · ') : '—';
-
-  const embed = {
-    title: 'User interested',
-    url: jump,
-    color: 0x57f287,
-    author: {
-      name: message.author.tag,
-      ...(avatar ? { icon_url: avatar } : {})
-    },
-    ...(avatar ? { thumbnail: { url: avatar } } : {}),
-    fields: [
-      {
-        name: 'Username',
-        value: message.author.tag,
-        inline: true
-      },
-      {
-        name: 'Context',
-        value: contextLine.slice(0, 256),
-        inline: true
-      },
-      {
-        name: 'Message',
-        value: (message.content || '(no text)').slice(0, 900) || '—',
-        inline: false
-      },
-      {
-        name: 'Jump',
-        value: `[Open message](${jump})`,
-        inline: false
-      }
-    ],
-    timestamp: new Date().toISOString()
-  };
-
-  await postDiscordWebhook({ embeds: [embed] });
-  console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+  const shouldExplainRobud = phraseHit || (replyToPromo && messageLooksLikePromoFollowUpQuestion(message.content));
+  if (shouldExplainRobud) {
+    await trySendProdInterestInfoReply(message);
+  }
 }
 
 async function postOptionalChatWatchWebhook({
@@ -1282,7 +1352,7 @@ client.on('messageCreate', async (message) => {
       prodChannelMessageSerial++;
     }
 
-    await tryHandleProdInterestWebhook(message);
+    await tryHandleProdUserInterest(message);
 
     if (await tryHandleProdCannedReplyPromo(message)) return;
     if (await tryHandleProdWlChannel(message)) return;
@@ -1307,6 +1377,11 @@ client.on('ready', async () => {
   }
   if (ENABLE_PROD_WL_REPLIES) {
     console.log(`[Prod W/L] ENABLED — trade image nudges in ${PROD_CHANNEL_ID}`);
+  }
+  if (ENABLE_PROD_INTEREST_INFO_REPLIES) {
+    console.log(
+      `[Interest reply] On promo replies / trigger phrases in ${PROD_CHANNEL_ID} — in-channel robud info (cooldown ${PROD_INTEREST_REPLY_COOLDOWN_MS / 1000}s per user).`
+    );
   }
 
   cachedAdvertChannel = await client.channels.fetch(PROD_CHANNEL_ID);
