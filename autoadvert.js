@@ -19,7 +19,7 @@ const TOKEN = requireEnv('DISCORD_TOKEN');
 /** Google AI Studio key. Set as GEMINI_API_KEY. */
 const GEMINI_API_KEY = requireEnv('GEMINI_API_KEY');
 /**
- * Optional: if set, post a short embed after each pre-promo chat sample (same payload as console summary).
+ * Optional: chat samples, promo gate on/off, and “user interested” pings.
  * Set as DISCORD_WEBHOOK_URL in Railway.
  */
 const DISCORD_WEBHOOK_URL = (process.env.DISCORD_WEBHOOK_URL || '').trim();
@@ -212,6 +212,11 @@ let imageAdvertEverSent = false;
 let promoCaptionRotate = 0;
 let promoImageRotate = 0;
 
+/** `undefined` until first observation; then used to avoid duplicate gate webhooks. */
+let lastWebhookPromoGateOnline = undefined;
+
+const interestWebhookHandledIds = new Set();
+
 function formatIso(ms) {
   return new Date(ms).toISOString();
 }
@@ -301,6 +306,111 @@ Plain text only, no markdown.`;
   return 'Gemini summary unavailable.';
 }
 
+async function postDiscordWebhook(payload) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  try {
+    const res = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      console.warn('[Webhook] HTTP', res.status, res.statusText);
+    }
+  } catch (e) {
+    console.warn('[Webhook] Error:', e.message || e);
+  }
+}
+
+function getPromoGateDisplayLabel(member) {
+  if (!member) return PROMO_GATE_USERNAME;
+  const d = member.displayName && String(member.displayName).trim();
+  if (d) return d;
+  return member.user?.username || PROMO_GATE_USERNAME;
+}
+
+/**
+ * Ping webhook when promo gate goes online (stop promos) or offline (resume promos).
+ * First observed state does not ping (baseline).
+ */
+async function emitPromoGateStateWebhookIfChanged(gateOnline, gateMember) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  if (lastWebhookPromoGateOnline === undefined) {
+    lastWebhookPromoGateOnline = gateOnline;
+    return;
+  }
+  if (lastWebhookPromoGateOnline === gateOnline) return;
+  lastWebhookPromoGateOnline = gateOnline;
+  const label = getPromoGateDisplayLabel(gateMember);
+  const text = gateOnline ? `${label} online, stopping promo` : `${label} offline, promoting`;
+  await postDiscordWebhook({ content: text });
+  console.log(`[Webhook] Gate state: ${text}`);
+}
+
+function messageMatchesInterestTrigger(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/\bwhat\s+is\s+(that|this)\b/.test(t)) return true;
+  if (/\bhow\s+do\s+i\s+get\s+that\b/.test(t)) return true;
+  if (/\bis\s+this\s+an\s+extension\b/.test(t)) return true;
+  return false;
+}
+
+async function tryHandleProdInterestWebhook(message) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
+   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
+  if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return;
+  if (interestWebhookHandledIds.has(message.id)) return;
+  if (!messageMatchesInterestTrigger(message.content)) return;
+
+  interestWebhookHandledIds.add(message.id);
+  if (interestWebhookHandledIds.size > 5000) interestWebhookHandledIds.clear();
+
+  const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${message.id}`;
+  let avatar = '';
+  try {
+    avatar =
+      typeof message.author.displayAvatarURL === 'function'
+        ? message.author.displayAvatarURL({ dynamic: true, size: 256 })
+        : '';
+  } catch {
+    avatar = '';
+  }
+
+  const embed = {
+    title: 'User interested (trigger phrase)',
+    url: jump,
+    color: 0x57f287,
+    author: {
+      name: message.author.tag,
+      ...(avatar ? { icon_url: avatar } : {})
+    },
+    ...(avatar ? { thumbnail: { url: avatar } } : {}),
+    fields: [
+      {
+        name: 'Username',
+        value: message.author.tag,
+        inline: true
+      },
+      {
+        name: 'Message',
+        value: (message.content || '(no text)').slice(0, 900) || '—',
+        inline: false
+      },
+      {
+        name: 'Jump',
+        value: `[Open message](${jump})`,
+        inline: false
+      }
+    ],
+    timestamp: new Date().toISOString()
+  };
+
+  await postDiscordWebhook({ embeds: [embed] });
+  console.log(`[Webhook] Interest ping — ${message.author.tag}`);
+}
+
 async function postOptionalChatWatchWebhook({
   geminiSummary,
   report,
@@ -308,7 +418,6 @@ async function postOptionalChatWatchWebhook({
   gapLine,
   isFastTier
 }) {
-  if (!DISCORD_WEBHOOK_URL) return;
   const embed = {
     title: `Chat activity sample — channel ${PROD_CHANNEL_ID}`,
     description: geminiSummary.slice(0, 4096),
@@ -321,20 +430,8 @@ async function postOptionalChatWatchWebhook({
     ],
     timestamp: new Date().toISOString()
   };
-  try {
-    const res = await fetch(DISCORD_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ embeds: [embed] })
-    });
-    if (!res.ok) {
-      console.warn('[Chat watch] Webhook HTTP', res.status, res.statusText);
-    } else {
-      console.log('[Chat watch] Webhook posted (DISCORD_WEBHOOK_URL).');
-    }
-  } catch (e) {
-    console.warn('[Chat watch] Webhook error:', e.message || e);
-  }
+  await postDiscordWebhook({ embeds: [embed] });
+  console.log('[Chat watch] Webhook posted (sample).');
 }
 
 function startPrePromoSample() {
@@ -458,6 +555,7 @@ async function trySendAdvertAfterSample() {
     return;
   }
   promoGateIsOnline = isEffectivelyOnline(gate);
+  await emitPromoGateStateWebhookIfChanged(promoGateIsOnline, gate);
   if (promoGateIsOnline) {
     console.log(`[Advert] Promo gate online (${PROMO_GATE_USERNAME}) — not sending.`);
     return;
@@ -676,6 +774,7 @@ async function pollAdvert() {
       return;
     }
     promoGateIsOnline = isEffectivelyOnline(gate);
+    await emitPromoGateStateWebhookIfChanged(promoGateIsOnline, gate);
     if (promoGateIsOnline) {
       console.log(
         `[Poll] Promo gate online (${PROMO_GATE_USERNAME}) — no promos (${new Date().toISOString()})`
@@ -987,6 +1086,24 @@ async function tryHandleProdWlChannel(message) {
 
 const client = new Client({ checkUpdate: false });
 
+client.on('presenceUpdate', async (oldPresence, newPresence) => {
+  try {
+    const guild = newPresence?.guild;
+    if (!guild || guild.id !== PROD_GUILD_ID) return;
+    if (!cachedPromoGateUserId || newPresence.userId !== cachedPromoGateUserId) return;
+    const st = newPresence.status;
+    const isOn = st === 'online' || st === 'idle' || st === 'dnd';
+    promoGateIsOnline = isOn;
+    let mem = guild.members.cache.get(newPresence.userId);
+    if (!mem) {
+      mem = await guild.members.fetch(newPresence.userId, { force: true }).catch(() => null);
+    }
+    await emitPromoGateStateWebhookIfChanged(isOn, mem);
+  } catch (e) {
+    console.warn('[presenceUpdate]', e?.message || e);
+  }
+});
+
 client.on('messageCreate', async (message) => {
   try {
     appendChatWatchSample(message);
@@ -1001,6 +1118,8 @@ client.on('messageCreate', async (message) => {
       advertProdMessagesSinceSend++;
       prodChannelMessageSerial++;
     }
+
+    await tryHandleProdInterestWebhook(message);
 
     if (await tryHandleProdCannedReplyPromo(message)) return;
     if (await tryHandleProdWlChannel(message)) return;
@@ -1050,6 +1169,7 @@ client.on('ready', async () => {
   }
 
   promoGateIsOnline = Boolean(gateMember && isEffectivelyOnline(gateMember));
+  await emitPromoGateStateWebhookIfChanged(promoGateIsOnline, gateMember);
 
   startPrePromoSample();
 
