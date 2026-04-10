@@ -445,29 +445,27 @@ async function emitPromotionStartedWebhook(sentMessage) {
 }
 
 /**
- * Cheap gate so we do not call Gemini on every channel message.
- * @param {string} raw
- * @param {boolean} replyToOutreach
+ * Normal Roblox trading chat ("how much does X get?", w/l, value checks) — NOT questions about the robud promo.
+ * If this matches, skip interest classification entirely (avoids replying "it tells u if a trade is good" to random traders).
  */
-function shouldInvokeInterestClassifier(raw, replyToOutreach) {
-  if (replyToOutreach) return true;
-  const t = (raw || '').trim();
-  if (!t || t.length > 500) return false;
-  if (/\brobud\b/i.test(t)) return true;
-  if (/\b(browser\s+)?extension\b/i.test(t) && /\b(what|where|how|which|install|download|get|is|does|link)\b/i.test(t)) {
-    return true;
-  }
-  if (
-    /[?]/.test(t) &&
-    t.length < 320 &&
-    /\b(what|where|how|which|install|download|extension|link|that|this|it)\b/i.test(t)
-  ) {
-    return true;
-  }
-  return classifyProdInterestLegacyGate(t) != null;
+function looksLikeRobloxTradeOrValueQuestion(raw) {
+  const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/\brobud\b/i.test(t)) return false;
+  if (/\b(browser\s+)?extension\b/i.test(t) && /\b(chrome|install|download|what|where)\b/i.test(t)) return false;
+
+  if (/\bhow\s+much\b/.test(t)) return true;
+  if (/\bhow\s+many\b/.test(t)) return true;
+  if (/\b(does|do|will)\s+\S+\s+get\b/.test(t)) return true;
+  if (/\b(is|are)\s+.+\b(worth|overpay|underpay|fair|bias|trade)\b/.test(t)) return true;
+  if (/\bvalue\s+(check|of|on)\b/.test(t) || /\b(check|what)\s+value\b/.test(t)) return true;
+  if (/\bw\/?\s*l\b/.test(t)) return true;
+  if (/\bwin\s*[/]\s*loss\b/.test(t) || /\bwin\s+or\s+loss\b/.test(t)) return true;
+  if (/\b(should\s+i|would\s+you)\s+(take|accept|do)\b/.test(t)) return true;
+  return false;
 }
 
-/** Regex-only fallback when Gemini fails; also used as a sparse gate above. */
+/** Regex-only fallback when Gemini fails. */
 function classifyProdInterestLegacyGate(raw) {
   const t = (raw || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!t) return null;
@@ -537,7 +535,7 @@ async function classifyInterestIntentWithGemini(userText, replyToOutreach) {
   const snippet = (userText || '').trim().slice(0, 900);
   const prompt = `You classify ONE Discord message. The product is a browser extension called "robud" (Roblox trading). Downstream, a separate step will send a very short, casual teenager-style reply — your job is ONLY to route intent correctly (not to write the reply).
 
-Context: reply_thread=${replyToOutreach ? 'yes' : 'no'} (if yes, they are likely replying to someone who mentioned robud or a promo).
+Context: reply_thread=${replyToOutreach ? 'yes' : 'no'} (yes = they used Discord reply on a message from this bot session that was an advert or nudge).
 
 Message:
 ${JSON.stringify(snippet)}
@@ -546,8 +544,16 @@ Output EXACTLY two lines. No markdown, no quotes, no extra words.
 Line 1: INTEREST: YES or NO
 Line 2: INTENT: one of WHAT_IS | WHAT_DOES | HOW_TO_GET | IS_EXTENSION | NONE
 
-INTEREST YES when they are clearly trying to learn about robud / the promoted thing / the extension in a question or confused follow-up (including informal wording, typos, all caps, slang).
-INTEREST NO for: insults, pure off-topic, flexing "i already have it" with no question, jokes unrelated to robud, other games, spam, or statements that are not asking anything about robud/extension.
+INTEREST YES only when they are clearly asking about the robud browser extension / what someone meant by "robud" / the thing being promoted — NOT general Roblox trading help.
+
+INTEREST NO (always) for messages that are normal trade/value chat with NO indication they mean robud/extension, including but not limited to:
+- "how much does X get", "how much lb", item abbreviations (cs, lb, cf, etc.), demand/supply value questions
+- w/l, win/loss, "is this a good trade", "should i accept", overpay/underpay, bias
+- Any question that could be answered with Rolimons / values alone without mentioning an extension
+
+INTEREST NO for: insults, unrelated games, spam, "i already have it" with no question, jokes not about robud.
+
+If the message could plausibly be either, choose INTEREST: NO unless they mention robud, extension, chrome store, install, or clearly refer to YOUR prior promo/nudge. If reply_thread=yes but the text is obviously a normal value/trade question (e.g. "how much does X get"), still INTEREST: NO.
 
 INTENT (if INTEREST YES; if NO then INTENT: NONE):
 - WHAT_IS — identity / what is that / what is this / what's robud / what are you talking about (NOT "how do I install").
@@ -647,18 +653,15 @@ Output ONLY the reply text. No quotes around it. No label like "Reply:". No mark
   return '';
 }
 
-async function messageIsReplyToOurOutreach(message) {
+/**
+ * Interest follow-ups only when the user hit "reply" on a message we sent THIS session
+ * (image promo, canned nudge, W/L line, or prior interest reply) — not random channel questions.
+ */
+function messageIsReplyToTrackedOutreach(message) {
   if (!isProdTargetChannel(message)) return false;
   const refId = message.reference?.messageId;
   if (!refId) return false;
-  if (recentPromoMessageIds.includes(refId)) return true;
-  try {
-    const ref = await message.fetchReference().catch(() => null);
-    if (!ref || ref.author?.id !== message.client.user?.id) return false;
-    return true;
-  } catch {
-    return false;
-  }
+  return recentPromoMessageIds.includes(refId);
 }
 
 async function postProdInterestWebhook(message, kind, replyToOutreach) {
@@ -732,13 +735,15 @@ async function postProdInterestWebhook(message, kind, replyToOutreach) {
  */
 async function tryHandleProdInterest(message) {
   if (!isProdTargetChannel(message)) return false;
+  if (looksLikeRobloxTradeOrValueQuestion(message.content)) return false;
   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return false;
   if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return false;
   if (promoGateIsOnline) return false;
   if (prodInterestHandledIds.has(message.id)) return false;
+  if (recentPromoMessageIds.length === 0) return false;
+  if (!messageIsReplyToTrackedOutreach(message)) return false;
 
-  const replyToOutreach = await messageIsReplyToOurOutreach(message);
-  if (!shouldInvokeInterestClassifier(message.content, replyToOutreach)) return false;
+  const replyToOutreach = true;
 
   const gemini = await classifyInterestIntentWithGemini(message.content, replyToOutreach);
   let kind = gemini.kind;
