@@ -75,7 +75,10 @@ const AD_PROMO_IMAGE_URLS = [
   'https://media.discordapp.net/attachments/1488271310281900194/1492007942684414032/image.png?ex=69d9c42d&is=69d872ad&hm=0c8d2c795548aecaf7ee0743359fc07ef6038f4d524950dbe55189c4df50475f&=&format=webp&quality=lossless'
 ];
 
-/** Canned robud nudges in prod between image adverts (not Gemini). */
+/**
+ * Canned robud nudges in prod between image adverts — only on messages with w/l-style text + trade image.
+ * Uses same vision + min Value check as Prod W/L (PROD_ROBUD_MIN_VALUE). Disabled when ENABLE_PROD_WL_REPLIES is on.
+ */
 const ENABLE_PROD_CANNED_REPLY_PROMOS = true;
 const REPLY_PROMO_QUOTA_PER_IMAGE_INTERVAL = 5;
 const REPLY_PROMO_MIN_PROD_MESSAGES_BETWEEN = 100;
@@ -778,8 +781,29 @@ function extensionForPromoAttachment(url, buffer) {
   return 'png';
 }
 
+/** Caption looks like inventory/flip ask, not a pending two-sided trade w/l. */
+function prodCaptionLooksLikeNonWlAsk(text) {
+  const t = (text || '').toLowerCase().replace(/\s+/g, ' ');
+  if (!t) return false;
+  if (/what\s+yall\s+think.*\bcan\b.*\bget\b/.test(t)) return true;
+  if (/\bwhat\b.*\b(these|this|they|it)\b.*\bcan\b.*\bget\b/.test(t)) return true;
+  if (/\b(best|good)\s+flip\b/.test(t)) return true;
+  if (/\b(showing|show)\s+(off\s+)?(a\s+)?(good\s+)?(trade|flip)\b/.test(t)) return true;
+  return false;
+}
+
+function messageContentLooksLikeWlAsk(text) {
+  const t = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/\bw\/?\s*l\b/.test(t)) return true;
+  if (/\bwin\s*[/]\s*loss\b/.test(t)) return true;
+  if (/\bwin\s+or\s+loss\b/.test(t)) return true;
+  return false;
+}
+
 async function tryHandleProdCannedReplyPromo(message) {
   if (!ENABLE_PROD_CANNED_REPLY_PROMOS) return false;
+  if (ENABLE_PROD_WL_REPLIES) return false;
   if (!imageAdvertEverSent) return false;
   if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return false;
   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) {
@@ -796,7 +820,33 @@ async function tryHandleProdCannedReplyPromo(message) {
   }
 
   const text = (message.content || '').trim();
-  if (text.length < 1 && !message.attachments?.size) return false;
+  if (!messageContentLooksLikeWlAsk(text)) return false;
+  if (prodCaptionLooksLikeNonWlAsk(text)) return false;
+
+  const imagePart = await getFirstInlineImageFromMessage(message);
+  if (!imagePart) return false;
+
+  let evaluation;
+  try {
+    evaluation = await evaluateRobudTradeScreenshot(imagePart, text);
+  } catch (e) {
+    console.warn('[Reply promo] Vision evaluate failed:', e.message || e);
+    return false;
+  }
+
+  const decision = robudWorthyFromEvaluation(evaluation);
+  if (!decision.worthy) {
+    if (decision.reasonKey === 'below_min_value') {
+      console.log(
+        `[Reply promo] Skip — max Value ${decision.maxValue} < ${PROD_ROBUD_MIN_VALUE} (${message.author.tag})`
+      );
+    } else if (decision.reasonKey === 'not_wl_trade') {
+      console.log(`[Reply promo] Skip — not a pending w/l trade UI (${message.author.tag})`);
+    } else if (decision.reasonKey === 'value_unknown') {
+      console.log(`[Reply promo] Skip — could not read Value (${message.author.tag})`);
+    }
+    return false;
+  }
 
   const line = pickRandom(CANNED_ROBUD_REPLIES);
   try {
@@ -805,7 +855,7 @@ async function tryHandleProdCannedReplyPromo(message) {
     lastCannedReplyAtSerial = prodChannelMessageSerial;
     cannedReplyNudgedUserIds.add(message.author.id);
     console.log(
-      `[Reply promo] ${cannedRepliesSentThisImageInterval}/${REPLY_PROMO_QUOTA_PER_IMAGE_INTERVAL} → ${message.author.tag} (serial ${prodChannelMessageSerial})`
+      `[Reply promo] ${cannedRepliesSentThisImageInterval}/${REPLY_PROMO_QUOTA_PER_IMAGE_INTERVAL} → ${message.author.tag} (max Value ${decision.maxValue})`
     );
     return true;
   } catch (e) {
@@ -1112,16 +1162,6 @@ Output ONLY the reply text, no quotes.`;
     'y dont u have robud its easier than js sending w/ls',
     'just get robud dawg \u{1F62D}'
   ]);
-}
-
-function prodCaptionLooksLikeNonWlAsk(text) {
-  const t = (text || '').toLowerCase().replace(/\s+/g, ' ');
-  if (!t) return false;
-  if (/what\s+yall\s+think.*\bcan\b.*\bget\b/.test(t)) return true;
-  if (/\bwhat\b.*\b(these|this|they|it)\b.*\bcan\b.*\bget\b/.test(t)) return true;
-  if (/\b(best|good)\s+flip\b/.test(t)) return true;
-  if (/\b(showing|show)\s+(off\s+)?(a\s+)?(good\s+)?(trade|flip)\b/.test(t)) return true;
-  return false;
 }
 
 function replyDelayMs(channel) {
