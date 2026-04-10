@@ -19,8 +19,8 @@ const TOKEN = requireEnv('DISCORD_TOKEN');
 /** Google AI Studio key. Set as GEMINI_API_KEY. */
 const GEMINI_API_KEY = requireEnv('GEMINI_API_KEY');
 /**
- * Optional: chat samples, promo gate on/off, and “user interested” pings.
- * Set as DISCORD_WEBHOOK_URL in Railway.
+ * Optional incoming webhook URL — one URL for every Discord notification this bot sends:
+ * chat samples, promotion started/stopped/resumed, user interest. Omit to skip all webhooks.
  */
 const DISCORD_WEBHOOK_URL = (process.env.DISCORD_WEBHOOK_URL || '').trim();
 
@@ -217,6 +217,18 @@ let lastWebhookPromoGateOnline = undefined;
 
 const interestWebhookHandledIds = new Set();
 
+/** Recent image promo message IDs (this session) — used to detect replies. */
+const RECENT_PROMO_MESSAGE_IDS_CAP = 15;
+const recentPromoMessageIds = [];
+
+function rememberPromoMessageId(id) {
+  if (!id) return;
+  recentPromoMessageIds.push(id);
+  while (recentPromoMessageIds.length > RECENT_PROMO_MESSAGE_IDS_CAP) {
+    recentPromoMessageIds.shift();
+  }
+}
+
 function formatIso(ms) {
   return new Date(ms).toISOString();
 }
@@ -342,9 +354,53 @@ async function emitPromoGateStateWebhookIfChanged(gateOnline, gateMember) {
   if (lastWebhookPromoGateOnline === gateOnline) return;
   lastWebhookPromoGateOnline = gateOnline;
   const label = getPromoGateDisplayLabel(gateMember);
-  const text = gateOnline ? `${label} online, stopping promo` : `${label} offline, promoting`;
-  await postDiscordWebhook({ content: text });
-  console.log(`[Webhook] Gate state: ${text}`);
+  if (gateOnline) {
+    await postDiscordWebhook({
+      embeds: [
+        {
+          title: 'Promotion stopped',
+          description: `${label} is online — pausing promos until they go offline.`,
+          color: 0xe74c3c,
+          timestamp: new Date().toISOString()
+        }
+      ]
+    });
+    console.log(`[Webhook] Promotion stopped — ${label} online`);
+  } else {
+    await postDiscordWebhook({
+      embeds: [
+        {
+          title: 'Promotion resumed',
+          description: `${label} is offline — promos are allowed (cadence + sampling still apply).`,
+          color: 0x2ecc71,
+          timestamp: new Date().toISOString()
+        }
+      ]
+    });
+    console.log(`[Webhook] Promotion resumed — ${label} offline`);
+  }
+}
+
+async function emitPromotionStartedWebhook(sentMessage) {
+  if (!DISCORD_WEBHOOK_URL || !sentMessage?.id) return;
+  const jump = `https://discord.com/channels/${PROD_GUILD_ID}/${PROD_CHANNEL_ID}/${sentMessage.id}`;
+  const caption = (sentMessage.content || '').trim() || '—';
+  await postDiscordWebhook({
+    embeds: [
+      {
+        title: 'Promotion started',
+        description: `Image promo posted in <#${PROD_CHANNEL_ID}>.`,
+        url: jump,
+        color: 0xf1c40f,
+        fields: [
+          { name: 'Caption', value: caption.slice(0, 900), inline: false },
+          { name: 'Jump', value: `[Open promo message](${jump})`, inline: false }
+        ],
+        timestamp: new Date().toISOString()
+      }
+    ]
+  });
+  console.log('[Webhook] Promotion started — image sent');
 }
 
 function messageMatchesInterestTrigger(raw) {
@@ -356,13 +412,30 @@ function messageMatchesInterestTrigger(raw) {
   return false;
 }
 
+async function messageIsReplyToOurPromo(message) {
+  if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return false;
+  const refId = message.reference?.messageId;
+  if (!refId) return false;
+  if (recentPromoMessageIds.includes(refId)) return true;
+  try {
+    const ref = await message.fetchReference().catch(() => null);
+    if (!ref || ref.author?.id !== message.client.user?.id) return false;
+    return Boolean(ref.attachments?.size);
+  } catch {
+    return false;
+  }
+}
+
 async function tryHandleProdInterestWebhook(message) {
   if (!DISCORD_WEBHOOK_URL) return;
   if (message.channel?.id !== PROD_CHANNEL_ID || message.guild?.id !== PROD_GUILD_ID) return;
-   if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
+  if (!message.author?.id || message.author.bot || message.author.id === message.client.user.id) return;
   if (cachedPromoGateUserId && message.author.id === cachedPromoGateUserId) return;
   if (interestWebhookHandledIds.has(message.id)) return;
-  if (!messageMatchesInterestTrigger(message.content)) return;
+
+  const phraseHit = messageMatchesInterestTrigger(message.content);
+  const replyToPromo = await messageIsReplyToOurPromo(message);
+  if (!phraseHit && !replyToPromo) return;
 
   interestWebhookHandledIds.add(message.id);
   if (interestWebhookHandledIds.size > 5000) interestWebhookHandledIds.clear();
@@ -378,8 +451,13 @@ async function tryHandleProdInterestWebhook(message) {
     avatar = '';
   }
 
+  const contextParts = [];
+  if (replyToPromo) contextParts.push('Reply to image promo');
+  if (phraseHit) contextParts.push('Trigger phrase');
+  const contextLine = contextParts.length ? contextParts.join(' · ') : '—';
+
   const embed = {
-    title: 'User interested (trigger phrase)',
+    title: 'User interested',
     url: jump,
     color: 0x57f287,
     author: {
@@ -391,6 +469,11 @@ async function tryHandleProdInterestWebhook(message) {
       {
         name: 'Username',
         value: message.author.tag,
+        inline: true
+      },
+      {
+        name: 'Context',
+        value: contextLine.slice(0, 256),
         inline: true
       },
       {
@@ -745,11 +828,13 @@ async function sendAdvert(channel) {
 
   const imageBuffer = await downloadImage(imageUrl);
   const ext = extensionForPromoAttachment(imageUrl, imageBuffer);
-  await channel.send({
+  const sent = await channel.send({
     content: caption,
     files: [{ attachment: imageBuffer, name: `promo.${ext}` }]
   });
+  rememberPromoMessageId(sent.id);
   console.log(`[Send] Trade image advert — caption: ${JSON.stringify(caption)}`);
+  await emitPromotionStartedWebhook(sent);
 }
 
 async function pollAdvert() {
